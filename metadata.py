@@ -1,151 +1,154 @@
-"""
-dotninja.metadata
-Phase 5: Metadata Enrichment & Type Reconstruction
-"""
+"""CLR metadata resolution and parsed, view-owned token targets."""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any
+from binaryninja.log import log_warn
+from .signatures import FieldSignature, MethodSignature, parse_field_signature, parse_member_signature, parse_method_signature
 
-from binaryninja.log import log_error
+@dataclass(frozen=True)
+class TokenTarget:
+    token: int
+    kind: str
+    address: int | None
+    name: str
+    signature: MethodSignature | FieldSignature | None = None
 
+def _blob_bytes(value: Any) -> bytes:
+    value_bytes = getattr(value, "value_bytes", None)
+    if callable(value_bytes):
+        return bytes(value_bytes())
+    value = getattr(value, "value", value)
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    try:
+        return bytes(value)
+    except (TypeError, ValueError):
+        return b""
 
 class MetadataResolver:
     def __init__(self, pe):
         self.pe = pe
-        self._build_class_map()
+        self.method_to_class: dict[int, Any] = {}
+        self.field_to_class: dict[int, Any] = {}
+        self.targets: dict[int, TokenTarget] = {}
+        self._build_owner_maps()
 
-    def _build_class_map(self):
-        """Pre-compute a mapping of MethodDef indices to their parent TypeDef (Class/Namespace)"""
-        self.method_to_class = {}
-        mdtables = (
-            getattr(self.pe.net, "mdtables", None)
-            if hasattr(self.pe, "net") and self.pe.net
-            else None
-        )
-        type_def = getattr(mdtables, "TypeDef", None) if mdtables else None
-        if not type_def:
-            return
+    @property
+    def tables(self):
+        return getattr(getattr(self.pe, "net", None), "mdtables", None)
 
-        for type_row in type_def:
-            # dnfile helpfully resolves MethodList into an actual list of MethodDef rows
-            if hasattr(type_row, "MethodList") and isinstance(
-                type_row.MethodList, list
-            ):
-                for method_row in type_row.MethodList:
-                    if hasattr(method_row, "row_index"):
-                        # dnfile's row_index is 1-based. We use 0-based indexing internally.
-                        self.method_to_class[method_row.row_index - 1] = type_row
+    def _build_owner_maps(self):
+        type_defs = getattr(self.tables, "TypeDef", None) if self.tables else None
+        for owner in type_defs or ():
+            for row in getattr(owner, "MethodList", ()) or ():
+                if getattr(row, "row_index", None):
+                    self.method_to_class[int(row.row_index) - 1] = owner
+            for row in getattr(owner, "FieldList", ()) or ():
+                if getattr(row, "row_index", None):
+                    self.field_to_class[int(row.row_index) - 1] = owner
 
-    def get_method_full_name(self, method_row_idx):
-        """Reconstructs 'Namespace.Class::MethodName'"""
-        mdtables = (
-            getattr(self.pe.net, "mdtables", None)
-            if hasattr(self.pe, "net") and self.pe.net
-            else None
-        )
-        method_def = getattr(mdtables, "MethodDef", None) if mdtables else None
-        if not method_def or not (0 <= method_row_idx < len(method_def)):
-            return f"method_0x{method_row_idx+1:x}"
+    @staticmethod
+    def _qualified_type(row) -> str:
+        name = str(getattr(row, "TypeName", "") or "")
+        namespace = str(getattr(row, "TypeNamespace", "") or "")
+        return f"{namespace}.{name}" if namespace else name
 
-        row = method_def[method_row_idx]
-        name = getattr(row, "Name", None) or f"method_0x{method_row_idx+1:x}"
+    def get_method_full_name(self, index: int) -> str:
+        rows = getattr(self.tables, "MethodDef", None) if self.tables else None
+        if not rows or not 0 <= index < len(rows):
+            return f"method_0x{index + 1:x}"
+        name = str(getattr(rows[index], "Name", "") or f"method_0x{index + 1:x}")
+        owner = self.method_to_class.get(index)
+        return f"{self._qualified_type(owner)}::{name}" if owner else name
 
-        parent_class = self.method_to_class.get(method_row_idx)
-        if parent_class:
-            class_name = getattr(parent_class, "TypeName", "")
-            namespace = getattr(parent_class, "TypeNamespace", "")
-            if namespace:
-                return f"{namespace}.{class_name}::{name}"
-            return f"{class_name}::{name}"
-        return name
+    def get_field_full_name(self, index: int) -> str:
+        rows = getattr(self.tables, "Field", None) if self.tables else None
+        if not rows or not 0 <= index < len(rows):
+            return f"field_0x{index + 1:x}"
+        name = str(getattr(rows[index], "Name", "") or f"field_0x{index + 1:x}")
+        owner = self.field_to_class.get(index)
+        return f"{self._qualified_type(owner)}::{name}" if owner else name
 
-    def resolve_token(self, token):
-        """Resolves a 32-bit metadata token to its plaintext string representation"""
-        table_idx = token >> 24
-        row_idx = (token & 0x00FFFFFF) - 1
-
-        if table_idx == 0x70:  # UserString (#US stream)
-            try:
-                # The token's lower 3 bytes act as an offset into the string heap
-                offset = token & 0x00FFFFFF
-                string_val = self.pe.net.user_strings.get(offset)
-                print(
-                    f"Metadata parsing {string_val} with {offest}. {table_idx} {row_idx}"
-                )
-                if string_val:
-                    # Decode HeapItemString (bytes-like) to Python string
-                    try:
-                        decoded = string_val.decode("utf-8")
-                    except Exception as e:
-                        decoded = str(string_val)
-                        print(f"string issue as {e}")
-                    return f'"{decoded}"'
-                else:
-                    return ""  # Empty string if not found
-            except Exception as e:
-                log_error(f"Error reading string: {e}")
-            return '"<string read error>"'
-
-        mdtables = (
-            getattr(self.pe.net, "mdtables", None)
-            if hasattr(self.pe, "net") and self.pe.net
-            else None
-        )
-        if not mdtables:
+    def method_signature(self, row) -> MethodSignature | None:
+        try:
+            return parse_method_signature(_blob_bytes(getattr(row, "Signature", None)))
+        except (ValueError, TypeError) as exc:
+            log_warn(f"[dotninja] Invalid method signature: {exc}")
             return None
 
+    def field_signature(self, row) -> FieldSignature | None:
         try:
-            if table_idx == 0x06:  # MethodDef
-                return self.get_method_full_name(row_idx)
+            return parse_field_signature(_blob_bytes(getattr(row, "Signature", None)))
+        except (ValueError, TypeError) as exc:
+            log_warn(f"[dotninja] Invalid field signature: {exc}")
+            return None
 
-            elif table_idx == 0x0A:  # MemberRef (External method or field)
-                table = getattr(mdtables, "MemberRef", None)
-                if table and 0 <= row_idx < len(table):
-                    row = table[row_idx]
-                    class_token = getattr(row, "Class", None)
-                    class_name = ""
-                    if class_token:
-                        class_table_idx = getattr(class_token, "table_index", None)
-                        class_row_idx = getattr(class_token, "row_index", 0) - 1
-                        if class_table_idx == 0x01:  # TypeRef
-                            tr_table = getattr(mdtables, "TypeRef", None)
-                            if tr_table and 0 <= class_row_idx < len(tr_table):
-                                tr_row = tr_table[class_row_idx]
-                                ns = tr_row.TypeNamespace
-                                class_name = (
-                                    f"{ns}.{tr_row.TypeName}" if ns else tr_row.TypeName
-                                )
-                        elif class_table_idx == 0x02:  # TypeDef
-                            td_table = getattr(mdtables, "TypeDef", None)
-                            if td_table and 0 <= class_row_idx < len(td_table):
-                                td_row = td_table[class_row_idx]
-                                ns = td_row.TypeNamespace
-                                class_name = (
-                                    f"{ns}.{td_row.TypeName}" if ns else td_row.TypeName
-                                )
-                    method_name = getattr(row, "Name", f"member_0x{row_idx+1:x}")
-                    return f"{class_name}::{method_name}" if class_name else method_name
+    def member_signature(self, row) -> MethodSignature | FieldSignature | None:
+        try:
+            return parse_member_signature(_blob_bytes(getattr(row, "Signature", None)))
+        except (ValueError, TypeError) as exc:
+            log_warn(f"[dotninja] Invalid member signature: {exc}")
+            return None
 
-            elif table_idx == 0x01:  # TypeRef
-                table = getattr(mdtables, "TypeRef", None)
-                if table and 0 <= row_idx < len(table):
-                    row = table[row_idx]
-                    return (
-                        f"{row.TypeNamespace}.{row.TypeName}"
-                        if row.TypeNamespace
-                        else row.TypeName
-                    )
+    def _member_owner_name(self, row) -> str:
+        owner = getattr(row, "Class", None)
+        # dnfile coded-index objects expose the resolved row directly. Prefer
+        # it because recent dnfile versions do not populate table_index.
+        resolved_owner = getattr(owner, "row", None)
+        if resolved_owner is not None:
+            qualified = self._qualified_type(resolved_owner)
+            if qualified:
+                return qualified
+        table_index = getattr(owner, "table_index", None)
+        index = int(getattr(owner, "row_index", 0) or 0) - 1
+        table_name = {1: "TypeRef", 2: "TypeDef", 0x1B: "TypeSpec"}.get(table_index)
+        rows = getattr(self.tables, table_name, None) if table_name and self.tables else None
+        return self._qualified_type(rows[index]) if rows and 0 <= index < len(rows) else ""
 
-            elif table_idx == 0x02:  # TypeDef
-                table = getattr(mdtables, "TypeDef", None)
-                if table and 0 <= row_idx < len(table):
-                    row = table[row_idx]
-                    return f"{row.TypeName}"
+    def register_target(self, target: TokenTarget) -> TokenTarget:
+        self.targets[target.token] = target
+        return target
 
-            elif table_idx == 0x04:  # FieldDef
-                table = getattr(mdtables, "Field", None)
-                if table and 0 <= row_idx < len(table):
-                    row = table[row_idx]
-                    return f"{row.Name} (Field)"
-        except Exception as e:
-            log_error(f"Error resolving token: {e}")
-            return f"<invalid token {hex(token)}>"
-
+    def resolve_target(self, token: int) -> TokenTarget | None:
+        if token in self.targets:
+            return self.targets[token]
+        table, index = token >> 24, (token & 0xFFFFFF) - 1
+        if index < 0:
+            return None
+        try:
+            if table == 0x70:
+                item = self.pe.net.user_strings.get(token & 0xFFFFFF)
+                value = getattr(item, "value", item)
+                if isinstance(value, bytes):
+                    value = value.decode("utf-16-le", errors="replace")
+                return TokenTarget(token, "string", None, str(value or ""))
+            if table == 0x06:
+                rows = getattr(self.tables, "MethodDef", None)
+                if rows and index < len(rows):
+                    return TokenTarget(token, "method", None, self.get_method_full_name(index), self.method_signature(rows[index]))
+            if table == 0x04:
+                rows = getattr(self.tables, "Field", None)
+                if rows and index < len(rows):
+                    return TokenTarget(token, "field", None, self.get_field_full_name(index), self.field_signature(rows[index]))
+            if table == 0x0A:
+                rows = getattr(self.tables, "MemberRef", None)
+                if rows and index < len(rows):
+                    row, signature = rows[index], self.member_signature(rows[index])
+                    kind = "field" if isinstance(signature, FieldSignature) else "method"
+                    owner, name = self._member_owner_name(row), str(getattr(row, "Name", "") or f"member_0x{index + 1:x}")
+                    return TokenTarget(token, kind, None, f"{owner}::{name}" if owner else name, signature)
+            if table in (1, 2):
+                rows = getattr(self.tables, "TypeRef" if table == 1 else "TypeDef", None)
+                if rows and index < len(rows):
+                    return TokenTarget(token, "type", None, self._qualified_type(rows[index]))
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            log_warn(f"[dotninja] Failed token 0x{token:08x}: {exc}")
         return None
+
+    def resolve_token(self, token: int) -> str | None:
+        target = self.resolve_target(token)
+        if not target:
+            return None
+        return f'"{target.name}"' if target.kind == "string" else target.name

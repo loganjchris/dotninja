@@ -4,11 +4,12 @@ Phase 3 & 4: CIL Architecture & LLIL Parser (Restored & Stable)
 """
 
 import struct
-from typing import ClassVar, dict, Any
+from typing import Any, ClassVar
 
 from binaryninja import (
     Architecture,
     BranchType,
+    CallingConvention,
     InstructionInfo,
     InstructionTextToken,
     InstructionTextTokenType,
@@ -29,13 +30,11 @@ for _name in dir(OpCodes):
             _OPCODES_2[_op.value & 0xFF] = _op
 
 
-class DotNetArch(Architecture):
+class _DotNetArchBase(Architecture):
     """
     Custom DotNet Architecture implementation for Binary Ninja.
     Provides instruction decoding, basic block branching, text tokens, and low-level IL lifting.
     """
-
-    name = "dotnet"
 
     address_size = 4
     default_int_size = 4
@@ -45,13 +44,8 @@ class DotNetArch(Architecture):
     regs: ClassVar[dict[str, Any]] = {
         "ip": RegisterInfo("ip", 4),  # type: ignore
         "sp": RegisterInfo("sp", 4),  # type: ignore
+        "ret": RegisterInfo("ret", 4),  # type: ignore
     }
-
-    # Populate synthetic eval, local, and argument registers securely
-    for _i in range(256):
-        regs[f"eval_{_i}"] = RegisterInfo(f"eval_{_i}", 4)  # type: ignore
-        regs[f"loc_{_i}"] = RegisterInfo(f"loc_{_i}", 4)  # type: ignore
-        regs[f"arg_{_i}"] = RegisterInfo(f"arg_{_i}", 4)  # type: ignore
 
     stack_pointer = "sp"
 
@@ -75,7 +69,7 @@ class DotNetArch(Architecture):
         if not opcode:
             return None, None, 0
 
-        type_name = str(opcode.operand_type).split(".")[-1]
+        type_name = opcode.operand_type.name
         operand_value = None
         op_size = 0
         fmt = ""
@@ -103,7 +97,12 @@ class DotNetArch(Architecture):
             if len(data) >= instr_len + 4:
                 count = struct.unpack("<I", data[instr_len : instr_len + 4])[0]
                 op_size = 4 + (count * 4)
-                operand_value = count
+                if len(data) < instr_len + op_size:
+                    return None, None, 0
+                operand_value = tuple(
+                    struct.unpack_from("<i", data, instr_len + 4 + (index * 4))[0]
+                    for index in range(count)
+                )
             else:
                 return None, None, 0
 
@@ -125,8 +124,8 @@ class DotNetArch(Architecture):
             return info
 
         name = opcode.name.lower()
-        type_name = str(opcode.operand_type).split(".")[-1]
-        safe_operand = operand if operand is not None else 0
+        type_name = opcode.operand_type.name
+        safe_operand = int(operand) if isinstance(operand, (int, float)) else 0
 
         if name in ("br", "br.s", "leave", "leave.s"):
             info.add_branch(
@@ -137,24 +136,19 @@ class DotNetArch(Architecture):
         elif name in ("throw", "rethrow"):
             pass
         elif name in ("call", "callvirt", "newobj"):
-            if hasattr(self, "token_map") and safe_operand in self.token_map:
-                target = int(self.token_map[safe_operand])
-            else:
-                target = int(0x50000000 + (safe_operand & 0x00FFFFFF) * 4)
-            info.add_branch(BranchType.CallDestination, target)
+            # View-local token targets are resolved by LLIL. Advertising a
+            # synthetic architecture-level call target makes core analysis
+            # create and disassemble fake external functions.
+            pass
         elif name == "calli":
             info.add_branch(BranchType.IndirectBranch, int(safe_operand))
         elif name == "switch":
             base_addr = addr + length
-            for i in range(safe_operand):
-                offset_idx = (length - (safe_operand * 4)) + (i * 4)
-                if len(data) >= offset_idx + 4:
-                    target_offset = struct.unpack(
-                        "<i", data[offset_idx : offset_idx + 4]
-                    )[0]
-                    info.add_branch(
-                        BranchType.IndirectBranch, int(base_addr + target_offset)
-                    )
+            info.add_branch(BranchType.FalseBranch, base_addr)
+            for target_offset in operand or ():
+                info.add_branch(
+                    BranchType.IndirectBranch, int(base_addr + target_offset)
+                )
         elif name in (
             "brtrue",
             "brtrue.s",
@@ -205,10 +199,10 @@ class DotNetArch(Architecture):
         ]
         if operand is not None:
             tokens.append(InstructionTextToken(InstructionTextTokenType.TextToken, " "))
-            type_name = str(opcode.operand_type).split(".")[-1]
+            type_name = opcode.operand_type.name
 
             if type_name in ("InlineBrTarget", "ShortInlineBrTarget"):
-                target = addr + length + operand
+                target = addr + length + int(operand)
                 tokens.append(
                     InstructionTextToken(
                         InstructionTextTokenType.CodeRelativeAddressToken,
@@ -233,7 +227,8 @@ class DotNetArch(Architecture):
             elif type_name == "InlineSwitch":
                 tokens.append(
                     InstructionTextToken(
-                        InstructionTextTokenType.TextToken, f"({operand} jump targets)"
+                        InstructionTextTokenType.TextToken,
+                        "(" + ", ".join(hex(addr + length + offset) for offset in operand) + ")",
                     )
                 )
             elif "Var" in type_name:
@@ -264,3 +259,43 @@ class DotNetArch(Architecture):
         from .lifter import lift_instruction
 
         return lift_instruction(self, data, addr, il)
+
+
+class DotNet32(_DotNetArchBase):
+    name = "dotnet32"
+    address_size = 4
+    default_int_size = 4
+    regs = {
+        "ip": RegisterInfo("ip", 4),
+        "sp": RegisterInfo("sp", 4),
+        "ret": RegisterInfo("ret", 4),
+    }
+
+
+class DotNet64(_DotNetArchBase):
+    name = "dotnet64"
+    address_size = 8
+    default_int_size = 8
+    regs = {
+        "ip": RegisterInfo("ip", 8),
+        "sp": RegisterInfo("sp", 8),
+        "ret": RegisterInfo("ret", 8),
+    }
+
+
+class DotNetCallingConvention(CallingConvention):
+    """Stack-parameter convention for managed CIL methods."""
+
+    int_arg_regs: list[str] = []
+    float_arg_regs: list[str] = []
+    int_return_reg = "ret"
+    caller_saved_regs = ["ret"]
+
+
+# Backwards-compatible import name. New views select an explicit width.
+DotNetArch = DotNet32
+
+
+def decode_instruction(data, addr=0):
+    """Decode without relying on Binary Ninja's CoreArchitecture wrapper."""
+    return _DotNetArchBase._decode_instruction(None, data, addr)

@@ -1,0 +1,18 @@
+{
+  "pluginmetadataversion": 2,
+  "name": "dotninja",
+  "type": ["architecture", "binaryview", "helper"],
+  "api": ["python3"],
+  "description": "CLR metadata loader, CIL lifter, and managed-code analysis suite",
+  "longdescription": "Loads managed PE files, lifts CIL, reconstructs metadata, and validates results in the Binary Ninja UI.",
+  "license": { "name": "MIT" },
+  "platforms": ["Darwin", "Linux", "Windows"],
+  "installinstructions": {
+    "Darwin": "Install dnfile and dncil.",
+    "Linux": "Install dnfile and dncil.",
+    "Windows": "Install dnfile and dncil."
+  },
+  "version": "0.2.0",
+  "author": "dotninja contributors",
+  "minimumbinaryninjaversion": 4000
+}

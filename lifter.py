@@ -3,6 +3,102 @@ dotninja.lifter
 Phase 4 & 5: Pre-Pass Stack Simulation & LLIL Lifter (Fully Audited & Stabilized)
 """
 
+from collections import deque
+from binaryninja import LLIL_TEMP
+from binaryninja.log import log_warn
+from .signatures import MethodSignature, native_width, stack_effect
+from .arch import decode_instruction
+
+
+def _eval(index):
+    return LLIL_TEMP(max(0, int(index)))
+
+
+def _local(index):
+    return LLIL_TEMP(0x100000 + max(0, int(index)))
+
+
+def _argument(index):
+    return LLIL_TEMP(0x200000 + max(0, int(index)))
+
+
+def call_argument_indices(height, pops, indirect=False):
+    """Evaluation-stack slots containing call arguments, in declaration order."""
+    argument_count = max(0, int(pops) - (1 if indirect else 0))
+    first = max(0, int(height) - int(pops))
+    return tuple(range(first, first + argument_count))
+
+
+def array_element_size(opcode_name, pointer_size):
+    """Storage width for typed CIL array element instructions."""
+    name = opcode_name.lower()
+    suffix = name.rsplit(".", 1)[-1] if "." in name else ""
+    if suffix in ("i1", "u1"):
+        return 1
+    if suffix in ("i2", "u2"):
+        return 2
+    if suffix in ("i4", "u4", "r4"):
+        return 4
+    if suffix in ("i8", "r8"):
+        return 8
+    return int(pointer_size)
+
+
+def _method_context(view, address):
+    for start, body in view.session_data.get("method_bodies", {}).items():
+        if int(start) <= int(address) < int(start) + int(body.code_size):
+            return int(start), body
+    return None, None
+
+
+def _leave_destination(view, address, direct_target):
+    """Route leave through an enclosing finally handler when required."""
+    start, body = _method_context(view, address)
+    if start is None or body is None:
+        return direct_target
+    relative = int(address) - start
+    candidates = [
+        region for region in body.exception_regions
+        if region.flags & 0x2
+        and region.try_offset <= relative < region.try_offset + region.try_length
+    ]
+    if not candidates:
+        return direct_target
+    region = min(candidates, key=lambda item: item.try_length)
+    return start + int(region.handler_offset)
+
+
+def _finally_destination(view, address):
+    """Resolve a finally handler's continuation when all leaves agree."""
+    start, body = _method_context(view, address)
+    if start is None or body is None:
+        return None
+    relative = int(address) - start
+    region = next((
+        item for item in body.exception_regions
+        if item.flags & 0x2
+        and item.handler_offset <= relative < item.handler_offset + item.handler_length
+    ), None)
+    if region is None:
+        return None
+    cursor = start + int(region.try_offset)
+    end = cursor + int(region.try_length)
+    targets = set()
+    while cursor < end:
+        data = view.read(cursor, 16)
+        if not data:
+            break
+        try:
+            opcode, operand, length = decode_instruction(data, cursor)
+        except Exception:
+            break
+        if not opcode or length <= 0:
+            break
+        if opcode.name.lower() in ("leave", "leave.s") and operand is not None:
+            targets.add(cursor + length + int(operand))
+        cursor += length
+    return next(iter(targets)) if len(targets) == 1 else None
+
 
 def get_stack_delta(opcode_name, operand_val=None):
     """
@@ -40,23 +136,24 @@ def get_stack_delta(opcode_name, operand_val=None):
         "localloc",
         "sizeof",
         "arglist",
+        "ldsfld",
     ):
         return 1
 
     if name.startswith("ldloc") or name.startswith("ldarg"):
         return 1
 
-    if name.startswith("ldind.") or name in (
+    if name.startswith("ldind.") or name.startswith("conv.") or name in (
         "ldfld",
         "ldflda",
         "ldlen",
-        "conv",
         "box",
         "unbox",
         "unbox.any",
         "isinst",
         "castclass",
         "ckfinite",
+        "newarr",
     ):
         return 0  # Pops object/ptr/val, pushes converted/field/ptr/val
 
@@ -66,7 +163,7 @@ def get_stack_delta(opcode_name, operand_val=None):
     if name == "dup":
         return 1
 
-    if name.startswith("stloc") or name.startswith("starg") or name == "pop":
+    if name.startswith("stloc") or name.startswith("starg") or name in ("pop", "stsfld"):
         return -1
 
     if name.startswith("stind.") or name in ("stfld", "stobj", "initobj"):
@@ -83,9 +180,19 @@ def get_stack_delta(opcode_name, operand_val=None):
         "jmp",
         "switch",
         "throw",
-        "rethrow",
     ):
         return -1
+
+    if name in ("rethrow", "endfinally", "endfilter", "br", "br.s", "leave", "leave.s", "ret"):
+        return 0
+
+    if name in (
+        "beq", "beq.s", "bge", "bge.s", "bge.un", "bge.un.s",
+        "bgt", "bgt.s", "bgt.un", "bgt.un.s", "ble", "ble.s",
+        "ble.un", "ble.un.s", "blt", "blt.s", "blt.un", "blt.un.s",
+        "bne.un", "bne.un.s",
+    ):
+        return -2
 
     if name in (
         "beq",
@@ -135,10 +242,10 @@ def get_stack_delta(opcode_name, operand_val=None):
     ):
         return -1
 
-    if name in ("newobj", "call", "callvirt", "calli"):
-        return 0  # Fallback 0; dynamic call stack signature parsing handled via function types
+    if name in ("newobj", "call", "callvirt", "calli", "jmp"):
+        raise ValueError(f"{name} requires a parsed signature")
 
-    return 0
+    raise ValueError(f"unclassified CIL opcode: {name}")
 
 
 def analyze_function_stack(arch, func):
@@ -153,17 +260,23 @@ def analyze_function_stack(arch, func):
         return func.session_data["cil_stack"]
 
     stack_state = {func.start: 0}
-    queue = [func.start]
-    visited = set()
+    queue = deque([func.start])
     view = func.view
+    conflicts = []
+
+    body = view.session_data.get("method_bodies", {}).get(func.start)
+    if body is not None:
+        for region in body.exception_regions:
+            handler = func.start + int(region.handler_offset)
+            handler_height = 0 if region.flags & 0x2 else 1
+            stack_state.setdefault(handler, handler_height)
+            queue.append(handler)
 
     while queue:
-        curr_addr = queue.pop(0)
+        curr_addr = queue.popleft()
 
-        if curr_addr is None or curr_addr in visited:
+        if curr_addr is None:
             continue
-
-        visited.add(curr_addr)
         current_height = stack_state.get(curr_addr, 0)
 
         data = view.read(curr_addr, arch.max_instr_length)
@@ -171,29 +284,60 @@ def analyze_function_stack(arch, func):
             continue
 
         try:
-            opcode, operand, length = arch._decode_instruction(data, curr_addr)
-        except Exception:
-            print(f"Error decoding instruction at {curr_addr} with value {data}")
+            opcode, operand, length = decode_instruction(data, curr_addr)
+        except Exception as exc:
+            log_warn(f"[dotninja] Decode failed at {curr_addr:#x}: {exc}")
             continue
 
         if not opcode or length == 0:
             continue
 
-        delta = get_stack_delta(opcode.name, operand)
+        try:
+            if opcode.name.lower() in ("call", "callvirt", "calli", "newobj", "jmp"):
+                target = view.session_data.get("token_targets", {}).get(operand)
+                signature = getattr(target, "signature", None)
+                if not isinstance(signature, MethodSignature):
+                    raise ValueError("missing parsed call signature")
+                pops, pushes = stack_effect(signature, opcode.name.lower())
+                delta = pushes - pops
+            else:
+                delta = get_stack_delta(opcode.name, operand)
+        except ValueError as exc:
+            log_warn(f"[dotninja] Stack classification failed at {curr_addr:#x}: {exc}")
+            delta = 0
         next_height = max(0, current_height + delta)
 
         try:
             info = arch.get_instruction_info(data, curr_addr)
-        except Exception:
-            print(f"Error decoding instruction at {curr_addr} with value {data}")
+        except Exception as exc:
+            log_warn(f"[dotninja] Branch decode failed at {curr_addr:#x}: {exc}")
             info = None
 
-        if info and info.branches:
-            for branch in info.branches:
-                target = branch.target
-                if target is not None and target not in stack_state:
-                    stack_state[target] = next_height
-                    queue.append(target)
+        special_targets = None
+        opcode_name = opcode.name.lower()
+        if opcode_name in ("leave", "leave.s") and operand is not None:
+            direct = curr_addr + length + int(operand)
+            special_targets = (_leave_destination(view, curr_addr, direct),)
+            next_height = 0
+        elif opcode_name == "endfinally":
+            continuation = _finally_destination(view, curr_addr)
+            special_targets = (continuation,) if continuation is not None else ()
+
+        if special_targets is not None:
+            branches = special_targets
+        elif info and info.branches:
+            branches = tuple(branch.target for branch in info.branches)
+        else:
+            branches = ()
+        if branches:
+            for target in branches:
+                if target is not None:
+                    previous = stack_state.get(target)
+                    if previous is None:
+                        stack_state[target] = next_height
+                        queue.append(target)
+                    elif previous != next_height:
+                        conflicts.append((target, previous, next_height))
 
         # Propagate to standard fallthrough if not an exit instruction
         if opcode.name.lower() not in (
@@ -203,13 +347,20 @@ def analyze_function_stack(arch, func):
             "leave.s",
             "ret",
             "throw",
+            "rethrow",
             "endfinally",
+            "endfilter",
             "jmp",
         ):
             next_addr = curr_addr + length
             if next_addr not in stack_state:
                 stack_state[next_addr] = next_height
                 queue.append(next_addr)
+
+    if conflicts:
+        func.session_data["cil_stack_conflicts"] = conflicts
+        for target, left, right in conflicts:
+            log_warn(f"[dotninja] Stack-depth conflict at {target:#x}: {left} != {right}")
 
     func.session_data["cil_stack"] = stack_state
     return stack_state
@@ -220,7 +371,7 @@ def lift_instruction(arch, data, addr, il):
     Audited instruction lifter translating CIL stack operations into BNIL register expressions.
     """
     try:
-        opcode, operand, length = arch._decode_instruction(data, addr)
+        opcode, operand, length = decode_instruction(data, addr)
     except Exception:
         il.append(il.unimplemented())
         return 1
@@ -254,7 +405,7 @@ def lift_instruction(arch, data, addr, il):
     # Helper for conditional branch emission ensuring valid instruction handles
     def _emit_branch_if(true_target, false_target, invert=False, cond_expr=None):
         if cond_expr is None:
-            src_reg = f"eval_{max(0, height - 1)}"
+            src_reg = _eval(height - 1)
             reg_expr = il.reg(4, src_reg)
             const_zero = il.const(4, 0)
             if invert:
@@ -269,9 +420,9 @@ def lift_instruction(arch, data, addr, il):
 
         il.append(il.if_expr(cond_expr, t_label, f_label))
         il.mark_label(t_label)
-        il.append(il.jump(il.const_pointer(4, true_target)))
+        il.append(il.jump(il.const_pointer(arch.address_size, true_target)))
         il.mark_label(f_label)
-        il.append(il.jump(il.const_pointer(4, false_target)))
+        il.append(il.jump(il.const_pointer(arch.address_size, false_target)))
 
     # -------------------------------------------------------------
     # CIL Opcode Lifting Logic
@@ -305,32 +456,47 @@ def lift_instruction(arch, data, addr, il):
             val = -1
         elif name[-1].isdigit():
             val = int(name[-1])
-        il.append(il.set_reg(4, f"eval_{height}", il.const(4, val)))
+        il.append(il.set_reg(4, _eval(height), il.const(4, val)))
 
-    elif name in ("ldc.i8", "ldc.r4", "ldc.r8"):
+    elif name == "ldc.i8":
         val = operand if operand is not None else 0
-        size = 8 if name in ("ldc.i8", "ldc.r8") else 4
-        il.append(il.set_reg(size, f"eval_{height}", il.const(size, val)))
+        il.append(il.set_reg(8, _eval(height), il.const(8, int(val))))
+
+    elif name in ("ldc.r4", "ldc.r8"):
+        val = float(operand if operand is not None else 0.0)
+        expression = il.float_const_single(val) if name == "ldc.r4" else il.float_const_double(val)
+        il.append(il.set_reg(4 if name == "ldc.r4" else 8, _eval(height), expression))
 
     elif name in ("ldstr", "ldnull", "ldftn", "ldsflda", "ldtoken", "ldvirtftn"):
         val = operand if operand is not None else 0
-        if name == "ldftn":
+        if name in ("ldstr", "ldftn"):
             val = token_map.get(operand, val)
-        il.append(il.set_reg(4, f"eval_{height}", il.const_pointer(4, val)))
+        il.append(il.set_reg(arch.address_size, _eval(height), il.const_pointer(arch.address_size, val)))
 
     elif name in ("sizeof", "arglist", "localloc"):
         val = operand if operand is not None else 0
-        il.append(il.set_reg(4, f"eval_{height}", il.const(4, val)))
+        il.append(il.set_reg(4, _eval(height), il.const(4, val)))
 
     # Variable Access
     elif name.startswith("ldloc") or name.startswith("ldarg"):
         val = (
-            operand
-            if operand is not None
+            int(operand)
+            if isinstance(operand, int)
             else (int(name[-1]) if name[-1].isdigit() else 0)
         )
-        var_name = "arg" if name.startswith("ldarg") else "loc"
-        il.append(il.set_reg(4, f"eval_{height}", il.reg(4, f"{var_name}_{val}")))
+        if name.startswith("ldarg"):
+            # CIL arguments are modeled as stack parameters. Reading them from
+            # the incoming stack gives Binary Ninja a real parameter location
+            # instead of an uninitialized LLIL temporary.
+            address = il.add(
+                arch.address_size,
+                il.reg(arch.address_size, "sp"),
+                il.const(arch.address_size, (val + 1) * arch.address_size),
+            )
+            source_expr = il.load(arch.address_size, address)
+        else:
+            source_expr = il.reg(arch.address_size, _local(val))
+        il.append(il.set_reg(arch.address_size, _eval(height), source_expr))
 
     elif name.startswith("stloc") or name.startswith("starg"):
         val = (
@@ -339,16 +505,17 @@ def lift_instruction(arch, data, addr, il):
             else (int(name[-1]) if name[-1].isdigit() else 0)
         )
         var_name = "arg" if name.startswith("starg") else "loc"
-        src_reg = f"eval_{max(0, height - 1)}"
-        il.append(il.set_reg(4, f"{var_name}_{val}", il.reg(4, src_reg)))
+        src_reg = _eval(height - 1)
+        destination = _argument(val) if var_name == "arg" else _local(val)
+        il.append(il.set_reg(arch.address_size, destination, il.reg(arch.address_size, src_reg)))
 
     # Stack Management
     elif name == "pop":
         il.append(il.nop())
 
     elif name == "dup":
-        src_reg = f"eval_{max(0, height - 1)}"
-        il.append(il.set_reg(4, f"eval_{height}", il.reg(4, src_reg)))
+        src_reg = _eval(height - 1)
+        il.append(il.set_reg(arch.address_size, _eval(height), il.reg(arch.address_size, src_reg)))
 
     # Field & Object Access
     elif name in (
@@ -362,7 +529,7 @@ def lift_instruction(arch, data, addr, il):
         "unbox.any",
     ):
         val = operand if operand is not None else 0
-        il.append(il.set_reg(4, f"eval_{height}", il.const_pointer(4, val)))
+        il.append(il.set_reg(arch.address_size, _eval(height), il.const_pointer(arch.address_size, val)))
 
     elif name in ("stsfld", "stfld", "stobj", "initobj"):
         il.append(il.nop())
@@ -389,8 +556,8 @@ def lift_instruction(arch, data, addr, il):
         "shr",
         "shr.un",
     ):
-        left_reg = f"eval_{max(0, height - 2)}"
-        right_reg = f"eval_{max(0, height - 1)}"
+        left_reg = _eval(height - 2)
+        right_reg = _eval(height - 1)
         left = il.reg(4, left_reg)
         right = il.reg(4, right_reg)
 
@@ -432,15 +599,15 @@ def lift_instruction(arch, data, addr, il):
         il.append(il.set_reg(4, left_reg, res))
 
     elif name in ("neg", "not"):
-        src_reg = f"eval_{max(0, height - 1)}"
+        src_reg = _eval(height - 1)
         src = il.reg(4, src_reg)
         res = il.neg_expr(4, src) if name == "neg" else il.not_expr(4, src)
         il.append(il.set_reg(4, src_reg, res))
 
     # Comparisons
     elif name in ("ceq", "cgt", "cgt.un", "clt", "clt.un", "ckfinite"):
-        left_reg = f"eval_{max(0, height - 2)}"
-        right_reg = f"eval_{max(0, height - 1)}"
+        left_reg = _eval(height - 2)
+        right_reg = _eval(height - 1)
         left = il.reg(4, left_reg)
         right = il.reg(4, right_reg)
 
@@ -466,7 +633,9 @@ def lift_instruction(arch, data, addr, il):
     # Unconditional Control Flow
     elif name in ("br", "br.s", "leave", "leave.s"):
         target = _resolve_target(operand, is_relative=True)
-        il.append(il.jump(il.const_pointer(4, target)))
+        if name in ("leave", "leave.s") and il.source_function:
+            target = _leave_destination(il.source_function.view, addr, target)
+        il.append(il.jump(il.const_pointer(arch.address_size, target)))
 
     # Conditional Control Flow
     elif name in ("brtrue", "brtrue.s"):
@@ -503,8 +672,8 @@ def lift_instruction(arch, data, addr, il):
     ):
         target = _resolve_target(operand, is_relative=True)
         fallthrough = addr + length
-        left_reg = f"eval_{max(0, height - 2)}"
-        right_reg = f"eval_{max(0, height - 1)}"
+        left_reg = _eval(height - 2)
+        right_reg = _eval(height - 1)
         left = il.reg(4, left_reg)
         right = il.reg(4, right_reg)
 
@@ -532,10 +701,33 @@ def lift_instruction(arch, data, addr, il):
         _emit_branch_if(target, fallthrough, cond_expr=cond)
 
     elif name == "switch":
-        il.append(il.jump(il.reg(4, f"eval_{max(0, height - 1)}")))
+        selector = il.reg(4, _eval(height - 1))
+        base_addr = addr + length
+        targets = {}
+        for index, offset in enumerate(operand or ()):
+            label = il.get_label_for_address(arch, base_addr + offset)
+            if label is not None:
+                targets[index] = label
+        if targets:
+            il.append(il.jump_to(selector, targets))
+        else:
+            il.append(il.nop())
 
-    elif name in ("throw", "rethrow", "endfinally", "endfilter"):
-        il.append(il.no_return())
+    elif name == "endfinally":
+        continuation = (
+            _finally_destination(il.source_function.view, addr)
+            if il.source_function else None
+        )
+        if continuation is None:
+            il.append(il.trap(2))
+        else:
+            il.append(il.jump(il.const_pointer(arch.address_size, continuation)))
+
+    elif name in ("throw", "rethrow", "endfilter"):
+        # LLIL_TRAP is terminal and is available across supported Binary Ninja
+        # versions. Distinct values preserve the CIL terminal category.
+        trap_values = {"throw": 0, "rethrow": 1, "endfilter": 3}
+        il.append(il.trap(trap_values[name]))
 
     elif name == "jmp":
         target_vaddr = (
@@ -543,48 +735,190 @@ def lift_instruction(arch, data, addr, il):
             if operand is not None
             else _resolve_target(operand, is_relative=True)
         )
-        il.append(il.jump(il.const_pointer(4, target_vaddr if target_vaddr else 0)))
+        il.append(il.jump(il.const_pointer(arch.address_size, target_vaddr if target_vaddr else 0)))
 
     # Calls & Invocations
     elif name in ("call", "callvirt", "newobj", "calli"):
         target_vaddr = token_map.get(operand) if operand is not None else 0
-        if not target_vaddr and operand:
-            target_vaddr = 0x50000000 + (operand & 0x00FFFFFF) * 4
+        if not target_vaddr and isinstance(operand, int) and operand:
+            target_vaddr = (
+                0x50000000
+                + (operand & 0x00FFFFFF) * arch.address_size
+            )
 
-        if target_vaddr:
-            call_expr = il.call(il.const_pointer(4, target_vaddr))
-            il.append(il.set_reg(4, f"eval_{height}", call_expr))
+        target = None
+        if il.source_function and operand is not None:
+            target = il.source_function.view.session_data.get("token_targets", {}).get(operand)
+        signature = getattr(target, "signature", None)
+        pushes = 1 if name == "newobj" else 0
+        pops = 0
+        if isinstance(signature, MethodSignature):
+            pops, pushes = stack_effect(signature, name)
+
+        # LLIL calls infer arguments from calling-convention locations, not
+        # from the CIL evaluation stack. Marshal stack values explicitly in
+        # reverse order so the first declared argument occupies the first
+        # incoming stack slot.
+        argument_indices = call_argument_indices(height, pops, name == "calli")
+        for stack_index in reversed(argument_indices):
+            il.append(
+                il.push(
+                    arch.address_size,
+                    il.reg(arch.address_size, _eval(stack_index)),
+                )
+            )
+
+        if name == "calli":
+            destination = il.reg(arch.address_size, _eval(height - 1))
         else:
-            il.append(il.call(il.const(4, 0)))
+            destination = il.const_pointer(
+                arch.address_size, target_vaddr if target_vaddr else 0
+            )
+
+        if target_vaddr or name == "calli":
+            il.append(il.call(destination))
+            if argument_indices:
+                il.append(
+                    il.set_reg(
+                        arch.address_size,
+                        "sp",
+                        il.add(
+                            arch.address_size,
+                            il.reg(arch.address_size, "sp"),
+                            il.const(
+                                arch.address_size,
+                                len(argument_indices) * arch.address_size,
+                            ),
+                        ),
+                    )
+                )
+            if pushes:
+                il.append(
+                    il.set_reg(
+                        arch.address_size,
+                        _eval(height - pops),
+                        il.reg(arch.address_size, "ret"),
+                    )
+                )
+        else:
+            il.append(il.call(destination))
 
     # Memory & Pointer Operations
-    elif name.startswith(
-        ("conv.", "ldind.", "stind.", "ldelem.", "stelem.")
-    ) or name in (
+    elif name == "newarr":
+        slot = _eval(height - 1)
+        allocation = il.sub(
+            arch.address_size,
+            il.reg(arch.address_size, "sp"),
+            il.const(arch.address_size, 0x1000 + ((addr & 0xfff) << 4)),
+        )
+        il.append(il.store(
+            4,
+            il.sub(
+                arch.address_size, allocation,
+                il.const(arch.address_size, 4),
+            ),
+            il.reg(4, slot),
+        ))
+        il.append(il.set_reg(arch.address_size, slot, allocation))
+
+    elif name == "ldlen":
+        slot = _eval(height - 1)
+        length_address = il.sub(
+            arch.address_size,
+            il.reg(arch.address_size, slot),
+            il.const(arch.address_size, 4),
+        )
+        il.append(il.set_reg(
+            arch.address_size, slot,
+            il.zero_extend(arch.address_size, il.load(4, length_address)),
+        ))
+
+    elif name.startswith("stelem.") or name == "stelem":
+        size = array_element_size(name, arch.address_size)
+        array = il.reg(arch.address_size, _eval(height - 3))
+        index = il.reg(arch.address_size, _eval(height - 2))
+        address = il.add(
+            arch.address_size, array,
+            il.mult(
+                arch.address_size, index,
+                il.const(arch.address_size, size),
+            ),
+        )
+        il.append(il.store(size, address, il.reg(size, _eval(height - 1))))
+
+    elif name.startswith("ldelem.") or name in ("ldelem", "ldelema"):
+        size = array_element_size(name, arch.address_size)
+        destination = _eval(height - 2)
+        array = il.reg(arch.address_size, destination)
+        index = il.reg(arch.address_size, _eval(height - 1))
+        address = il.add(
+            arch.address_size, array,
+            il.mult(
+                arch.address_size, index,
+                il.const(arch.address_size, size),
+            ),
+        )
+        value = address if name == "ldelema" else il.load(size, address)
+        il.append(il.set_reg(
+            arch.address_size if name == "ldelema" else size,
+            destination, value,
+        ))
+
+    elif name.startswith("conv."):
+        slot = _eval(height - 1)
+        size = array_element_size(name, arch.address_size)
+        source = il.reg(min(size, arch.address_size), slot)
+        il.append(il.set_reg(size, slot, source))
+
+    elif name.startswith("ldind."):
+        slot = _eval(height - 1)
+        size = array_element_size(name, arch.address_size)
+        il.append(il.set_reg(size, slot, il.load(
+            size, il.reg(arch.address_size, slot)
+        )))
+
+    elif name.startswith("stind."):
+        size = array_element_size(name, arch.address_size)
+        il.append(il.store(
+            size,
+            il.reg(arch.address_size, _eval(height - 2)),
+            il.reg(size, _eval(height - 1)),
+        ))
+
+    elif name in (
         "cpobj",
         "cpblk",
         "initblk",
-        "ldlen",
-        "ldelema",
-        "newarr",
         "refanytype",
         "refanyval",
         "mkrefany",
         "ldobj",
     ):
-        if name.startswith("stind") or name in ("cpobj", "cpblk", "initblk"):
+        if name in ("cpobj", "cpblk", "initblk"):
             il.append(il.nop())
         else:
             il.append(
-                il.set_reg(4, f"eval_{height}", il.reg(4, f"eval_{max(0, height - 1)}"))
+                il.set_reg(arch.address_size, _eval(height), il.reg(arch.address_size, _eval(height - 1)))
             )
 
     # Returns
     elif name == "ret":
-        if height > 0:
-            il.append(il.ret(il.reg(4, f"eval_{max(0, height - 1)}")))
-        else:
-            il.append(il.ret(il.const(4, 0)))
+        signature = None
+        if il.source_function:
+            signature = il.source_function.view.session_data.get(
+                "method_signatures", {}
+            ).get(il.source_function.start)
+        if (
+            height > 0
+            and isinstance(signature, MethodSignature)
+            and not signature.return_type.is_void
+        ):
+            result_size = native_width(signature.return_type, arch.address_size)
+            result = il.reg(result_size, _eval(height - 1))
+            il.append(il.set_reg(result_size, "ret", result))
+        # LLIL_RET's expression is the native return address, not the managed
+        # return value. Calls place that address at the incoming stack top.
+        il.append(il.ret(il.pop(arch.address_size)))
 
     else:
         il.append(il.nop())

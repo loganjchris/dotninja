@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "fixtures": {
+    "validation-pe32": {
+      "sha256": "730bb63759608d922c9bae72955e41d1b12355344ff0e695e453be3ba3e8b10d",
+      "architecture": "dotnet32",
+      "sections": [
+        ".clr#~",
+        ".clr#Strings",
+        ".clr#US",
+        ".clr#Blob",
+        ".clr#GUID"
+      ],
+      "methods": {}
+    },
+    "validation-pe64": {
+      "sha256": "4c5271ff6d81cbd06e48a647e743064fdf3b45b622fc07ccaf74ea7d30868624",
+      "architecture": "dotnet64",
+      "sections": [
+        ".clr#~",
+        ".clr#Strings",
+        ".clr#US",
+        ".clr#Blob",
+        ".clr#GUID"
+      ],
+      "methods": {}
+    }
+  }
+}

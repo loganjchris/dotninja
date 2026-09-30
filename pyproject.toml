@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dotninja"
+version = "0.2.0"
+description = "Binary Ninja CLR metadata loader and CIL lifter"
+requires-python = ">=3.11"
+dependencies = ["dnfile>=0.18", "dncil>=1.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".."]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+exclude = ["fixtures"]
+reportMissingImports = "none"
+reportGeneralTypeIssues = "none"
+reportOptionalMemberAccess = "none"
+reportAttributeAccessIssue = "none"
+reportArgumentType = "none"
+reportIndexIssue = "none"
